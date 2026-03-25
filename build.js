@@ -60,8 +60,6 @@ const sharedOptions = {
   bundle: true,
   platform: "browser",
   target: "chrome120",
-  // Chrome extensions cannot use ES modules in service workers pre-MV3-module
-  // support, so we use IIFE format for content/SW and ESM for popup.
   logLevel: "info",
 };
 
@@ -78,11 +76,15 @@ async function build() {
     });
 
     // 2. Service worker — MV3 background script
+    // Must be ESM format so chrome.runtime.onMessage.addListener is registered
+    // at module top-level (not inside an IIFE), which Chrome's service worker
+    // lifecycle requires to reliably wake the SW on incoming messages.
+    // Pair with "type": "module" in manifest.json background section.
     await esbuild.build({
       ...sharedOptions,
       entryPoints: ["src/background/service-worker.ts"],
       outfile: path.join(outdir, "service-worker.js"),
-      format: "iife",
+      format: "esm",
     });
 
     // 3. Popup script
@@ -114,7 +116,7 @@ async function buildWatch() {
       ...sharedOptions,
       entryPoints: ["src/background/service-worker.ts"],
       outfile: path.join(outdir, "service-worker.js"),
-      format: "iife",
+      format: "esm",
     }),
     esbuild.context({
       ...sharedOptions,
