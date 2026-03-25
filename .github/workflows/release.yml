@@ -1,0 +1,22 @@
+name: Package Extension
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci && npm run build
+      - name: Zip extension
+        run: cd dist && zip -r ../yt-scorer-${{ github.ref_name }}.zip .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yt-scorer-${{ github.ref_name }}
+          path: yt-scorer-*.zip

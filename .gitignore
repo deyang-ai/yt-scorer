@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.claude/tool-usage.log
+*.zip
+.DS_Store
