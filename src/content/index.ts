@@ -1,301 +1,14 @@
 /**
  * content/index.ts — YT Scorer content script
  *
- * Observation strategy (read before editing):
- *
- * YouTube is a SPA built on Polymer custom elements with open shadow DOM.
- * Three things work against a naive badge-injection approach:
- *
- *   1. ytd-thumbnail lives in the shadow root of ytd-rich-item-renderer /
- *      ytd-video-renderer etc., so document.querySelectorAll('ytd-thumbnail')
- *      always returns 0.
- *
- *   2. YouTube re-renders shadow roots frequently (lazy image loading, infinite
- *      scroll, SPA navigation) — badges injected into shadow DOM are wiped.
- *
- *   3. yt-navigate-finish fires on every SPA page change; the entire
- *      ytd-app subtree may be rebuilt.
- *
- * Solution:
- *   • Query light-DOM renderer elements (ytd-rich-item-renderer, ytd-video-renderer …)
- *     which ARE findable from document.
- *   • Pierce each renderer's shadow root once to reach ytd-thumbnail.
- *   • Append the badge to ytd-thumbnail as a *light-DOM child* — it survives
- *     shadow-root re-renders because Polymer only replaces the shadow tree.
- *   • Stamp data-yt-scorer=<videoId> on ytd-thumbnail so we know the video ID
- *     even after the badge is wiped.
- *   • On every MutationObserver tick, re-badge any ytd-thumbnail whose badge
- *     is missing — use an in-memory score map so we never re-call the API.
- *   • ytd-thumbnail gets position:relative via injected CSS so absolute badges
- *     stay anchored to the thumbnail image.
+ * Simple, reliable approach:
+ *   1. Query ytd-thumbnail elements directly (works once YouTube renders them).
+ *   2. Find the /watch?v= anchor inside each thumbnail.
+ *   3. Show a loading badge, ask the service worker, update badge with score.
+ *   4. MutationObserver re-runs recheckBadges() on any DOM change — if YouTube
+ *      wipes a badge, we clear the processed attribute and re-process.
+ *   5. yt-navigate-finish + periodic retries handle SPA navigation.
  */
-
-import type { GetScoreMessage, ScoreResponse } from "../shared/types";
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/** Attribute stamped on ytd-thumbnail once we know its video ID. */
-const SCORED_ATTR = "data-yt-scorer";
-
-/** CSS class on every badge div. */
-const BADGE_CLASS = "yt-scorer-badge";
-
-/** Debounce for MutationObserver callbacks (ms). */
-const OBSERVER_DEBOUNCE_MS = 400;
-
-/** Delay after yt-navigate-finish before re-scanning (ms). */
-const NAVIGATE_DELAY_MS = 500;
-
-/** Renderer tag names that are in the light DOM and host a ytd-thumbnail. */
-const RENDERER_TAGS = [
-  "ytd-rich-item-renderer",
-  "ytd-video-renderer",
-  "ytd-compact-video-renderer",
-  "ytd-grid-video-renderer",
-] as const;
-
-// Selector string used in querySelectorAll
-const RENDERER_SELECTOR = RENDERER_TAGS.join(", ");
-
-// ---------------------------------------------------------------------------
-// In-memory score cache
-// ---------------------------------------------------------------------------
-
-/**
- * Scores retrieved from the service worker, keyed by videoId.
- * Populated on first request; used for instant re-badge after YouTube wipes
- * the DOM without making another API call.
- */
-const localScoreCache = new Map<string, number>();
-
-// ---------------------------------------------------------------------------
-// Badge styling
-// ---------------------------------------------------------------------------
-
-interface BadgeStyle { background: string; label: string; }
-
-function getBadgeStyle(score: number): BadgeStyle {
-  if (score >= 75) return { background: "#2ecc71", label: `${score} 👍` };
-  if (score >= 40) return { background: "#f1c40f", label: `${score} 😐` };
-  return { background: "#e74c3c", label: `${score} 👎` };
-}
-
-function createBadge(score: number): HTMLElement {
-  const { background, label } = getBadgeStyle(score);
-  const el = document.createElement("div");
-  el.className = BADGE_CLASS;
-  el.textContent = label;
-  Object.assign(el.style, {
-    position: "absolute",
-    top: "6px",
-    right: "6px",
-    background,
-    color: "#fff",
-    fontSize: "11px",
-    fontWeight: "bold",
-    fontFamily: "sans-serif",
-    padding: "2px 6px",
-    borderRadius: "4px",
-    zIndex: "9999",
-    pointerEvents: "none",
-    boxShadow: "0 1px 3px rgba(0,0,0,.5)",
-    lineHeight: "1.4",
-    whiteSpace: "nowrap",
-  });
-  return el;
-}
-
-/**
- * Append a badge to `target` (a ytd-thumbnail element).
- * Removes any stale badge first to avoid duplicates.
- */
-function injectBadge(target: HTMLElement, score: number): void {
-  target.querySelector(`.${BADGE_CLASS}`)?.remove();
-  target.appendChild(createBadge(score));
-  console.log(`[YT Scorer] Badge injected: score=${score} videoId=${target.getAttribute(SCORED_ATTR)}`);
-}
-
-// ---------------------------------------------------------------------------
-// Service worker communication
-// ---------------------------------------------------------------------------
-
-/**
- * Returns false once the extension has been reloaded or uninstalled.
- * chrome.runtime.id becomes undefined when the context is invalidated.
- */
-function isContextValid(): boolean {
-  try {
-    return !!chrome.runtime?.id;
-  } catch {
-    return false;
-  }
-}
-
-function requestScore(videoId: string): Promise<number | null> {
-  return new Promise((resolve) => {
-    // Guard: extension may have been reloaded since this content script started
-    if (!isContextValid()) { resolve(null); return; }
-
-    const message: GetScoreMessage = { type: "GET_SCORE", videoId };
-    try {
-      chrome.runtime.sendMessage(message, (response: ScoreResponse | undefined) => {
-        if (chrome.runtime.lastError) {
-          // Covers "Extension context invalidated" and "Receiving end does not exist"
-          console.warn("[YT Scorer] sendMessage error:", chrome.runtime.lastError.message);
-          resolve(null);
-          return;
-        }
-        const score = response?.score ?? null;
-        console.log(`[YT Scorer] SW response: videoId=${videoId} score=${score}`);
-        resolve(score);
-      });
-    } catch {
-      // Synchronous throw when context is already gone
-      resolve(null);
-    }
-  });
-}
-
-// ---------------------------------------------------------------------------
-// DOM helpers
-// ---------------------------------------------------------------------------
-
-function extractVideoId(href: string): string | null {
-  try {
-    return new URL(href, "https://www.youtube.com").searchParams.get("v");
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Find ytd-thumbnail inside a renderer.
- * Tries the renderer's shadow root first (standard Polymer layout), then light DOM.
- */
-function findThumbnailInRenderer(renderer: Element): HTMLElement | null {
-  return (
-    renderer.shadowRoot?.querySelector<HTMLElement>("ytd-thumbnail") ??
-    renderer.querySelector<HTMLElement>("ytd-thumbnail")
-  );
-}
-
-/**
- * Find the /watch?v= anchor inside a ytd-thumbnail.
- * Tries light DOM first (confirmed layout), then shadow root (fallback).
- */
-function findAnchorInThumbnail(thumbnail: HTMLElement): HTMLAnchorElement | null {
-  // Light DOM — confirmed HasLightAnchor: true on observed YouTube layout
-  const light = thumbnail.querySelector<HTMLAnchorElement>(
-    "a#thumbnail, a[href*='/watch?v=']"
-  );
-  if (light) return light;
-
-  // Shadow root fallback (layout may vary)
-  return (
-    thumbnail.shadowRoot?.querySelector<HTMLAnchorElement>(
-      "a#thumbnail, a[href*='/watch?v=']"
-    ) ?? null
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Core processing
-// ---------------------------------------------------------------------------
-
-/**
- * Process a single renderer element:
- *   1. Find ytd-thumbnail inside it.
- *   2. Find the /watch?v= anchor inside that thumbnail.
- *   3. Stamp data-yt-scorer on the thumbnail (idempotent).
- *   4. If the badge is already present → done.
- *   5. If we have the score in memory → re-badge immediately (YouTube wiped it).
- *   6. Otherwise → ask the service worker and badge once we hear back.
- */
-function processRenderer(renderer: Element): void {
-  const thumbnail = findThumbnailInRenderer(renderer);
-  if (!thumbnail) return;
-
-  const anchor = findAnchorInThumbnail(thumbnail);
-  if (!anchor) return;
-
-  const videoId = extractVideoId(anchor.href);
-  if (!videoId) return;
-
-  // Stamp the video ID on the thumbnail so we can re-badge after wipes
-  thumbnail.setAttribute(SCORED_ATTR, videoId);
-
-  // Badge already present — nothing to do
-  if (thumbnail.querySelector(`.${BADGE_CLASS}`)) return;
-
-  // Score already in memory (YouTube wiped the badge) — re-inject instantly
-  const cached = localScoreCache.get(videoId);
-  if (cached !== undefined) {
-    injectBadge(thumbnail, cached);
-    return;
-  }
-
-  // First time — ask the service worker
-  console.log(`[YT Scorer] Requesting SW score for videoId=${videoId}`);
-  requestScore(videoId).then((score) => {
-    if (score === null) {
-      console.log(`[YT Scorer] No score for ${videoId} (null — check API key)`);
-      return;
-    }
-    localScoreCache.set(videoId, score);   // save for re-badge on wipe
-    injectBadge(thumbnail, score);
-  });
-}
-
-/**
- * Scan the entire document for renderers and process each one.
- * Safe to call repeatedly — processRenderer() is idempotent per thumbnail.
- */
-function processAllThumbnails(): void {
-  const renderers = document.querySelectorAll<Element>(RENDERER_SELECTOR);
-  console.log(`[YT Scorer] processAllThumbnails: ${renderers.length} renderer(s) found`);
-  renderers.forEach(processRenderer);
-}
-
-// ---------------------------------------------------------------------------
-// MutationObserver
-// ---------------------------------------------------------------------------
-
-function debounce<T extends () => void>(fn: T, ms: number): T {
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  return (() => {
-    if (timer !== null) clearTimeout(timer);
-    timer = setTimeout(fn, ms);
-  }) as T;
-}
-
-/**
- * Watch document.body for any DOM changes.
- * Triggers on:
- *   • New renderer elements added (infinite scroll, SPA nav)
- *   • YouTube re-rendering shadow roots (causes badge wipe — we re-badge)
- *
- * Debounced at OBSERVER_DEBOUNCE_MS to absorb rapid burst mutations.
- */
-function startObserver(): void {
-  const debouncedScan = debounce(processAllThumbnails, OBSERVER_DEBOUNCE_MS);
-
-  const observer = new MutationObserver((mutations) => {
-    // Stop observing if the extension was reloaded — prevents "context invalidated" errors
-    if (!isContextValid()) {
-      observer.disconnect();
-      return;
-    }
-    const relevant = mutations.some((m) => m.addedNodes.length > 0 || m.removedNodes.length > 0);
-    if (relevant) debouncedScan();
-  });
-
-  // Watch the full subtree — YouTube mutates at arbitrary depths
-  observer.observe(document.body, { childList: true, subtree: true });
-
-  console.log("[YT Scorer] MutationObserver started on document.body");
-}
 
 // ---------------------------------------------------------------------------
 // Styles
@@ -306,25 +19,197 @@ function injectStyles(): void {
 
   const style = document.createElement("style");
   style.id = "yt-scorer-styles";
-  // Give ytd-thumbnail a stacking context so absolute badges land correctly.
-  // The badge is appended as a light-DOM child of ytd-thumbnail.
   style.textContent = `
-    ytd-thumbnail {
-      position: relative !important;
-      display: block;
-    }
-    .${BADGE_CLASS} {
+    ytd-thumbnail { position: relative !important; }
+    .yt-scorer-badge {
       position: absolute;
-      top: 6px; right: 6px;
-      font-size: 11px; font-weight: bold; font-family: sans-serif;
-      color: #fff; padding: 2px 6px; border-radius: 4px;
-      z-index: 9999; pointer-events: none;
-      box-shadow: 0 1px 3px rgba(0,0,0,.5);
-      line-height: 1.4; white-space: nowrap;
+      top: 6px;
+      left: 6px;
+      z-index: 9999;
+      padding: 3px 7px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: bold;
+      color: white;
+      pointer-events: none;
+      background: rgba(0,0,0,0.7);
+      font-family: -apple-system, sans-serif;
     }
+    .yt-scorer-badge.green  { background: #27ae60; }
+    .yt-scorer-badge.yellow { background: #f39c12; }
+    .yt-scorer-badge.red    { background: #e74c3c; }
+    .yt-scorer-badge.loading { background: rgba(0,0,0,0.5); }
   `;
-  document.head.appendChild(style);
-  console.log("[YT Scorer] #yt-scorer-styles injected");
+  (document.head || document.documentElement).appendChild(style);
+}
+
+// ---------------------------------------------------------------------------
+// In-memory score cache
+// ---------------------------------------------------------------------------
+
+/**
+ * Stores scores keyed by videoId for the lifetime of this page context.
+ * First visit: wait for SW response (2-5 s). Every re-render after that:
+ * badge is injected instantly from this map without touching the SW.
+ */
+const localCache = new Map<string, number>();
+
+// ---------------------------------------------------------------------------
+// Video ID extraction
+// ---------------------------------------------------------------------------
+
+function getVideoId(thumb: Element): string | null {
+  // Select by id first — works even before href is bound (skeleton elements).
+  // Fall back to href selector for non-standard layouts.
+  const a =
+    thumb.querySelector<HTMLAnchorElement>("a#thumbnail") ??
+    thumb.querySelector<HTMLAnchorElement>('a[href*="watch?v="]');
+  if (!a) return null;
+
+  // getAttribute returns the raw attribute value, which may be empty string
+  // while YouTube's data binding is still pending (skeleton state).
+  const href = a.getAttribute("href") ?? "";
+  if (!href) return null; // not hydrated yet — observer will retry on href change
+
+  const match = href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
+  return match ? match[1] : null;
+}
+
+// ---------------------------------------------------------------------------
+// Process a single ytd-thumbnail
+// ---------------------------------------------------------------------------
+
+/** Apply a numeric score to an existing badge element in-place. */
+function applyScore(badge: HTMLElement, score: number): void {
+  if (score >= 75) {
+    badge.textContent = `${score} 👍`;
+    badge.className = "yt-scorer-badge green";
+  } else if (score >= 40) {
+    badge.textContent = `${score} 😐`;
+    badge.className = "yt-scorer-badge yellow";
+  } else {
+    badge.textContent = `${score} 👎`;
+    badge.className = "yt-scorer-badge red";
+  }
+}
+
+async function processThumbnail(thumb: Element): Promise<void> {
+  // Skip if already processed (attribute set means in-flight or done)
+  if (thumb.getAttribute("data-yt-scorer")) return;
+
+  const videoId = getVideoId(thumb);
+  if (!videoId) return;
+
+  // Mark immediately so concurrent MutationObserver callbacks don't double-process
+  thumb.setAttribute("data-yt-scorer", videoId);
+
+  // --- Fast path: score already in memory from a previous SW round-trip ---
+  const cached = localCache.get(videoId);
+  if (cached !== undefined) {
+    const badge = document.createElement("div");
+    badge.className = "yt-scorer-badge";
+    thumb.appendChild(badge);
+    applyScore(badge, cached);
+    console.log(`[YT Scorer] score received (cache): ${videoId}`, cached);
+    return;
+  }
+
+  // --- Slow path: ask the service worker (first time seeing this video) ---
+  const badge = document.createElement("div");
+  badge.className = "yt-scorer-badge loading";
+  badge.textContent = "...";
+  thumb.appendChild(badge);
+
+  try {
+    const response: { score?: number; error?: string } | undefined =
+      await chrome.runtime.sendMessage({ type: "GET_SCORE", videoId });
+
+    if (response && typeof response.score === "number") {
+      const score = Math.round(response.score);
+      localCache.set(videoId, score); // store so re-renders are instant
+      applyScore(badge, score);
+      console.log(`[YT Scorer] score received (sw): ${videoId}`, score);
+    } else {
+      // Show the actual error so we can diagnose what's failing
+      const errText = (response as { error?: string })?.error ?? "no response";
+      console.warn(`[YT Scorer] null score for ${videoId}:`, errText);
+      badge.textContent = errText.slice(0, 14);
+      badge.className = "yt-scorer-badge";
+      badge.style.cssText = "background:rgba(120,0,200,0.9)!important;font-size:10px!important;";
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[YT Scorer] sendMessage failed for ${videoId}:`, msg);
+    badge.textContent = msg.slice(0, 14);
+    badge.className = "yt-scorer-badge";
+    badge.style.cssText = "background:rgba(200,0,0,0.9)!important;font-size:10px!important;";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Scan / recheck
+// ---------------------------------------------------------------------------
+
+/** Process all ytd-thumbnail elements currently in the document. */
+function processAll(): void {
+  document.querySelectorAll("ytd-thumbnail").forEach((thumb) => {
+    processThumbnail(thumb).catch(() => {});
+  });
+}
+
+/**
+ * For every already-processed thumbnail, check whether YouTube wiped its
+ * badge.  If so, clear the attribute so processAll() will re-process it.
+ */
+function recheckBadges(): void {
+  document.querySelectorAll("ytd-thumbnail[data-yt-scorer]").forEach((thumb) => {
+    // If the anchor href is gone (YouTube recycled the element for a new video),
+    // clear everything so this thumbnail is treated as fresh on the next processAll.
+    const currentVideoId = getVideoId(thumb);
+    const stampedVideoId = thumb.getAttribute("data-yt-scorer");
+    if (!currentVideoId || currentVideoId !== stampedVideoId) {
+      thumb.querySelector(".yt-scorer-badge")?.remove();
+      thumb.removeAttribute("data-yt-scorer");
+      return;
+    }
+
+    if (!thumb.querySelector(".yt-scorer-badge")) {
+      const cached = localCache.get(stampedVideoId);
+      if (cached !== undefined) {
+        // Score in memory — re-inject instantly, no SW round-trip
+        const badge = document.createElement("div");
+        badge.className = "yt-scorer-badge";
+        thumb.appendChild(badge);
+        applyScore(badge, cached);
+      } else {
+        // Not cached yet — clear so processAll() re-queues a SW request
+        thumb.removeAttribute("data-yt-scorer");
+      }
+    }
+  });
+  processAll();
+}
+
+// ---------------------------------------------------------------------------
+// MutationObserver
+// ---------------------------------------------------------------------------
+
+function startObserver(): void {
+  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const observer = new MutationObserver(() => {
+    // Debounce at 400 ms to absorb rapid YouTube DOM bursts
+    if (debounceTimer !== null) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(recheckBadges, 400);
+  });
+
+  observer.observe(document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["href"], // catch YouTube data-binding filling in the href
+  });
+  console.log("[YT Scorer] MutationObserver active");
 }
 
 // ---------------------------------------------------------------------------
@@ -332,27 +217,24 @@ function injectStyles(): void {
 // ---------------------------------------------------------------------------
 
 function bootstrap(): void {
-  console.log("[YT Scorer] bootstrap() — content script initialising");
-
-  // Inject CSS (sets position:relative on ytd-thumbnail)
+  console.log("[YT Scorer] bootstrap()");
   injectStyles();
-
-  // Immediate scan of already-visible thumbnails
-  processAllThumbnails();
-
-  // Watch for new/replaced thumbnails (infinite scroll, re-renders)
+  processAll();
   startObserver();
 
-  // Second immediate pass to cover anything added between the first scan
-  // and the observer starting
-  processAllThumbnails();
+  // Delayed retries to catch thumbnails that load after document_idle
+  setTimeout(processAll, 1000);
+  setTimeout(processAll, 3000);
 
-  // Re-scan after every YouTube SPA navigation
+  // SPA navigation: YouTube fires this after each page transition
   document.addEventListener("yt-navigate-finish", () => {
-    console.log("[YT Scorer] yt-navigate-finish — scheduling re-scan");
-    // Delay gives YouTube time to render the new page's thumbnails
-    setTimeout(() => processAllThumbnails(), NAVIGATE_DELAY_MS);
+    console.log("[YT Scorer] yt-navigate-finish");
+    setTimeout(processAll, 800);
   });
 }
 
-bootstrap();
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", bootstrap);
+} else {
+  bootstrap();
+}

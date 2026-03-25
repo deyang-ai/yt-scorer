@@ -136,27 +136,34 @@ async function fetchComments(videoId: string, apiKey: string): Promise<string[]>
  * Returns a ScoreResponse that will be sent back via sendResponse.
  */
 async function handleGetScore(videoId: string): Promise<ScoreResponse> {
+  console.log(`[SW] GET_SCORE received for ${videoId}`);
+
   // 1. Read settings — bail early if the extension is disabled or no API key
   const settings = await readSettings();
+  console.log(`[SW] settings: apiKey=${settings.apiKey ? settings.apiKey.slice(0,8)+"..." : "(empty)"} enabled=${settings.enabled}`);
 
   if (!settings.enabled) {
     return { videoId, score: null, error: "Extension is disabled" };
   }
 
   if (!settings.apiKey) {
-    return { videoId, score: null, error: "No API key configured" };
+    return { videoId, score: null, error: "NO_API_KEY" };
   }
 
   // 2. Check cache
   const cached = await getCached(videoId);
   if (cached !== null) {
+    console.log(`[SW] Cache hit for ${videoId}: ${cached}`);
     return { videoId, score: cached };
   }
 
   // 3. Fetch comments and compute score
   try {
+    console.log(`[SW] Fetching comments for ${videoId}...`);
     const comments = await fetchComments(videoId, settings.apiKey);
+    console.log(`[SW] Got ${comments.length} comments for ${videoId}`);
     const score = scoreComments(comments);
+    console.log(`[SW] Score for ${videoId}: ${score}`);
 
     // 4. Persist in cache
     await setCached(videoId, score);
@@ -164,7 +171,7 @@ async function handleGetScore(videoId: string): Promise<ScoreResponse> {
     return { videoId, score };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.warn(`[YT Scorer] Failed to score video ${videoId}:`, message);
+    console.warn(`[SW] Failed to score video ${videoId}:`, message);
     return { videoId, score: null, error: message };
   }
 }
