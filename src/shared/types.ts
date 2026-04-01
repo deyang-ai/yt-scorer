@@ -52,8 +52,8 @@ export interface ExtensionSettings {
 // ---------------------------------------------------------------------------
 
 export interface YouTubeCommentSnippet {
-  topLevelComment: {
-    snippet: {
+  topLevelComment?: {
+    snippet?: {
       textDisplay: string;
     };
   };

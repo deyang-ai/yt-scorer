@@ -122,9 +122,9 @@ async function fetchComments(videoId: string, apiKey: string): Promise<string[]>
     throw new Error(`YouTube API error ${json.error.code}: ${json.error.message}`);
   }
 
-  return (json.items ?? []).map(
-    (item) => item.topLevelComment.snippet.textDisplay
-  );
+  return (json.items ?? [])
+    .map((item) => item.topLevelComment?.snippet?.textDisplay)
+    .filter((text): text is string => text != null);
 }
 
 // ---------------------------------------------------------------------------
